@@ -44,6 +44,14 @@
 并令这些步骤已完成的安全确认转为**待复核**，随后删除来源档案——**失败时整体回滚，不留下部分迁移**；
 历史推演报告保持原快照不变，合并后方案列表与方案详情立即显示保留档案。
 
+**待加试剂插入位置评估（v1.6 新增）**：在**已保存方案**上指定一股**待加试剂**（档案试剂，
+或临时试剂名 + 非空类别，并填写正数用量），系统对**首位、每两个相邻步骤之间、末尾**共 N+1
+个位置**逐一预演**，沿用该方案**当前生效规则版本**（没有时使用全局启用规则图），按既有
+有向 / 无向类别匹配与**首次 high 即中止**口径给出每个位置的**首次危险、被阻断的原步骤与
+命中依据**（规则编号 / 方程式 / 机理 / 文献 / 类别对 / 参与步骤）。**优先推荐无 high 的
+位置**；所有位置都有 high 时选**未被阻断的原步骤最多**者，其余依次按**警示命中数少、
+位置靠前**决胜。结果**只作预览**：不保存步骤、不写推演记录、也不要求安全确认。
+
 > ⚠️ 本工具用于教学、方案预检与安全评审辅助，**不能替代**实验室 SOP、MSDS 与专业安全评估。
 
 ---
@@ -125,6 +133,9 @@ uvicorn app.main:app --reload --port 8000
 11. 合并重复档案：在 **🧪 试剂档案** 页点 **🔀 合并重复档案**，选择**来源**（将被删除）与
     **保留**档案后 **🔍 预览合并影响**——核对受影响步骤、两侧名称 / 类别（类别不一致时会醒目提示），
     再 **✅ 确认合并**。受影响步骤的已完成安全确认会转「待复核」，历史推演报告保持原样（详见第八章）。
+12. 评估待加试剂位置：在「已保存方案」卡片点 **🧭 插入评估**，选择档案试剂或填写临时试剂
+    （名称 + 非空类别）与正数用量，系统对首位、各相邻步骤之间与末尾逐一预演，
+    标出每个位置的首次危险、被阻断原步骤与命中依据，并 ⭐ 推荐最稳妥的位置（详见第九章）。
 
 ---
 
@@ -529,7 +540,176 @@ curl -sS -X POST http://localhost:8000/api/reagents/merge/confirm \
 在 409 发生前不会迁移任何步骤引用，来源档案也仍然保留。请求 / 响应字段与错误码与既有版本
 完全一致，旧客户端无需改造（仅需按既有 409「重新预览」约定重试）。
 
-## 九、导出的 JSON 结果结构
+## 九、待加试剂插入位置评估（逐位置预演 · 不落库）
+
+> 场景：方案已经保存，临时还要补加一股试剂，希望在**真正改方案前**先看清楚——放在第几步之间
+> 最不容易引发严重反应？每个候选位置会触发什么危险、阻断哪些原有步骤、依据是哪条规则？
+
+在 **📋 配液方案** 页的已保存方案卡片上点 **🧭 插入评估**，或直接调用 HTTP API。
+输入一股待加试剂，两种来源**二选一**：
+
+- **档案试剂**：传 `reagent_id`，类别按档案**实时解析**；
+- **临时试剂**：传 `reagent_name` 与**非空** `categories`（一个或多个类别 key）；
+- 两种方式都必须填写**正数** `amount_ml`（用量，mL/g），可附 `note` 备注。
+
+系统随后对该方案的 **N+1 个可插入位置**逐一预演：
+
+| 位次 `position` | 含义 |
+| --- | --- |
+| `0` | **首位**（第 1 步之前） |
+| `1 … N-1` | **第 k 步与第 k+1 步之间**（`after_step=k-1`、`before_step=k`，0 基） |
+| `N` | **末尾**（最后一步之后） |
+
+### 判定口径（与正式推演完全一致）
+
+1. **规则来源**：读取该方案唯一 `published` 的规则版本快照；方案没有生效版本
+   （从未发布 / 已停用 / 已被替代）时回落**全局启用规则图**——与 `simulate` 同一路径；
+2. 每个位置都把待加试剂插入后**整体重跑推演引擎**：有向边仅 `source→target` 触发、
+   无向边双向等价，**首次命中 high 即中止**，后续步骤标记阻断；
+3. 报告把插入后序列的步骤编号**换算回原方案步骤号**（`*_original` 字段），
+   并明确标注每个 finding 与首次危险涉及的是**待加试剂**还是**原第几步**；
+4. 被阻断步骤拆分为两部分：`blocked_original_steps`（**被阻断的原步骤**，0 基原编号）
+   与 `inserted_blocked`（待加试剂自身是否未及加入）。
+
+### 推荐位次（严格按序决胜）
+
+1. **先选无 high 的位置**（推演不中止）；
+2. 若所有位置都有 high：选**未被阻断的原步骤最多**者，即
+   `blocked_original_count` 最小（= 原步骤总数 − 被阻断原步骤数）；
+3. 仍并列：**警示（medium）命中数少**者优先；
+4. 仍并列：**位置靠前**（`position` 小）者优先。
+
+> 注意：把危险试剂放在**末尾**常常能让全部原步骤先执行完（阻断原步骤为 0），
+> 但它本身仍会发生严重反应——这是"两害相权"的比较结果，**绝不代表该位置安全**，
+> 请结合网页上的首次危险与命中依据综合判断。
+
+### HTTP API
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/plans/{id}/placement-preview` | 对已保存方案逐一预演 N+1 个插入位置并给出推荐，**不落库 / 不要求安全确认** |
+
+请求：
+
+```json
+{
+  "reagent_id": 1,
+  "amount_ml": 20,
+  "note": "可选备注"
+}
+```
+
+或临时试剂（与 `reagent_id` 二选一）：
+
+```json
+{
+  "reagent_name": "新配制王水",
+  "categories": ["strong_acid", "oxidizer"],
+  "amount_ml": 20
+}
+```
+
+响应（摘要）：
+
+```json
+{
+  "kind": "labmix-placement-preview",
+  "plan_id": 1,
+  "plan_name": "示例①氰化物废液酸化处理（错误做法）",
+  "rule_scope": "global",
+  "rule_revision": "2026.09",
+  "candidate": { "reagent_id": null, "name": "新盐酸",
+                 "categories": ["strong_acid"], "amount_ml": 20, "note": null },
+  "original_step_count": 3,
+  "position_count": 4,
+  "recommended": {
+    "position": 3,
+    "label": "末尾（第 3 步之后）",
+    "after_step": 2,
+    "before_step": null,
+    "has_danger": true,
+    "blocked_original_count": 0,
+    "warning_hit_count": 1,
+    "reason": "所有 4 个位置均会触发严重危险并中止推演；该位置仅阻断 0 个原步骤（3 个原步骤可执行）……",
+    "rank_basis": {
+      "rule": "no_danger > max_unblocked_original > fewer_warnings > earlier_position",
+      "has_danger": true, "blocked_original_count": 0,
+      "executed_original_count": 3, "warning_hit_count": 1, "position": 3
+    }
+  },
+  "positions": [
+    {
+      "position": 0,
+      "label": "首位（第 1 步之前）",
+      "after_step": -1,
+      "before_step": 0,
+      "status": "danger",
+      "status_label": "存在严重危险",
+      "has_danger": true,
+      "inserted_state": "ok",
+      "inserted_state_label": "相容，已加入体系",
+      "first_danger": {
+        "rule_id": "R001", "title": "酸与氰化物接触生成剧毒氰化氢",
+        "reaction": "CN⁻ + H⁺ → HCN↑（剧毒气体）", "rationale": "……",
+        "references": ["……"],
+        "step": 1, "step_original": 0, "step_is_inserted": false,
+        "conflicts_with_step": 0, "conflicts_with_step_original": null,
+        "conflicts_with_is_inserted": true
+      },
+      "blocked_original_steps": [1, 2],
+      "blocked_original_count": 2,
+      "inserted_blocked": false,
+      "warning_original_steps": [],
+      "executed_original_count": 1,
+      "finding_counts": { "high": 1, "medium": 0, "low": 0 },
+      "findings": [
+        { "id": "F001", "rule_id": "R001", "severity": "high",
+          "incoming_category": "cyanide", "existing_category": "strong_acid",
+          "incoming_step": 1, "incoming_step_original": 0, "incoming_is_inserted": false,
+          "existing_step": 0, "existing_step_original": null, "existing_is_inserted": true,
+          "match_direction": "existing->incoming", "rule_directional": false,
+          "title": "……", "reaction": "……", "rationale": "……", "references": ["……"] }
+      ],
+      "timeline": [
+        { "order_index": 0, "original_order_index": null, "is_inserted": true,
+          "reagent_name": "新盐酸", "state": "ok", "state_label": "相容", "finding_ids": [] },
+        { "order_index": 1, "original_order_index": 0, "is_inserted": false,
+          "reagent_name": "氰化钾", "state": "danger", "state_label": "发生严重反应",
+          "finding_ids": ["F001"] }
+      ]
+    }
+  ]
+}
+```
+
+`rule_scope=plan_version` 时 `rule_revision` 为 `plan{方案ID}-rv{版本号}`，
+并带 `rule_version` 摘要；`global` 时为全局规则图版本号。**空方案**（0 步）也可评估，
+此时只有 `position=0`（首位）一个位置。
+
+**4xx 约定**：方案不存在 → `404`；引用的档案试剂不存在 → `404`；
+档案与临时试剂混填（`reagent_id` 与 `reagent_name` 同时给）、二者都不给、
+临时试剂类别为空（或全为空白）、用量 ≤ 0 / 非数值 → `422`。
+该接口**纯只读**：不创建 / 修改任何步骤，不产生推演记录，也不检查安全确认状态。
+
+#### 调用示例
+
+```bash
+# 档案试剂：评估把「盐酸」(id=1) 以 20 mL 加入方案 #1 的最佳位置
+curl -sS -X POST http://localhost:8000/api/plans/1/placement-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"reagent_id": 1, "amount_ml": 20}'
+
+# 临时试剂：自定义名称 + 类别
+curl -sS -X POST http://localhost:8000/api/plans/1/placement-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"reagent_name": "新配制王水", "categories": ["strong_acid", "oxidizer"],
+       "amount_ml": 20, "note": "滴加"}'
+# -> {"kind": "labmix-placement-preview", "position_count": 4,
+#     "positions": [ ...每个位置的首次危险 / 被阻断原步骤 / 命中依据... ],
+#     "recommended": {"position": 3, "label": "末尾（第 3 步之后）", "reason": "……"}}
+```
+
+## 十、导出的 JSON 结果结构
 
 `GET /api/plans/{id}/export`（实时推演）或 `GET /api/runs/{id}/export`（历史记录）：
 
@@ -593,7 +773,7 @@ curl -sS -X POST http://localhost:8000/api/reagents/merge/confirm \
 
 ---
 
-## 十、版本差异视图（规则升级影响评估）
+## 十一、版本差异视图（规则升级影响评估）
 
 当规则图升级（修改 `rules.yaml` 重启、网页停用/改级、追加自定义规则）后，对**同一方案**重新推演，
 即可在「🗂️ 推演记录」中比较新旧两条记录。对齐口径为
@@ -650,7 +830,7 @@ curl -sS -X POST http://localhost:8000/api/reagents/merge/confirm \
 
 ---
 
-## 十一、HTTP API 速览
+## 十二、HTTP API 速览
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -667,6 +847,7 @@ curl -sS -X POST http://localhost:8000/api/reagents/merge/confirm \
 | GET/POST/PUT/DELETE | `/api/plans/{id}/rule-versions[/{vid}[/publish\|/deactivate]]` | **规则版本：创建 / 编辑草稿 / 发布 / 停用 / 删除** |
 | GET | `/api/plans/{id}/rule-versions/diff?base=&target=` | **规则版本差异（支持 `global`）** |
 | POST | `/api/plans/simulate-dry` | 不保存方案，直接预检（使用全局图） |
+| POST | `/api/plans/{id}/placement-preview` | **待加试剂插入位置评估：首位 / 各相邻步骤之间 / 末尾逐一预演，返回每处首次危险、被阻断原步骤与命中依据及推荐位次；沿用当前生效规则版本（无则全局图），不落库** |
 | GET | `/api/plans/{id}/export` | 实时推演并下载 JSON |
 | GET | `/api/rules[?active_only=true]` | 规则边 + 类别元信息 + 版本号 |
 | POST | `/api/rules` | 追加自定义规则 |
@@ -696,11 +877,15 @@ curl -sS -X POST http://localhost:8000/api/reagents/merge/confirm \
 确认令牌缺失 / 过短 → `422`；令牌无效 / 过期 / 已使用 / 与所选档案不一致，
 或预览后任一档案属性、受影响步骤发生变化 → `409`（要求重新预览，不写入、无部分迁移）。
 
+**插入位置评估接口的 4xx 约定**：方案不存在 → `404`；引用的档案试剂不存在 → `404`；
+档案与临时试剂混填、二者都不给、临时试剂类别为空（或全为空白）、用量 ≤ 0 / 非数值 → `422`。
+接口纯只读，不产生步骤或推演记录，也不检查安全确认。
+
 完整交互模型见 <http://localhost:8000/docs>。
 
 ---
 
-## 十二、目录结构
+## 十三、目录结构
 
 ```
 .
@@ -716,6 +901,7 @@ curl -sS -X POST http://localhost:8000/api/reagents/merge/confirm \
 │   ├── merging.py          # 重复试剂档案合并：预览令牌、乐观校验、单事务迁移与待复核联动
 │   ├── importer.py         # 方案 CSV 导入：解析、逐行校验、单事务落库
 │   ├── bucketing.py        # 废液分桶：high 规则冲突图 + 分支限界精确求解（最少桶/最小最大负载/名称序列稳定）
+│   ├── placement.py        # 待加试剂插入位置评估：N+1 个位置逐一预演 + 推荐位次（不落库）
 │   ├── engine.py           # 相容性逐步推演引擎（核心算法）
 │   ├── deduce.py           # 方案 → 规则版本解析 → 引擎输入 → 报告 → 落盘
 │   ├── diffing.py          # 两条历史记录的版本差异对齐与汇总
@@ -732,7 +918,7 @@ curl -sS -X POST http://localhost:8000/api/reagents/merge/confirm \
 └── requirements.txt
 ```
 
-## 十三、配置项
+## 十四、配置项
 
 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- |

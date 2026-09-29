@@ -1029,5 +1029,194 @@ call("DELETE", f"/api/plans/{merge_plan}")
 call("DELETE", f"/api/reagents/{merge_tgt}")
 call("DELETE", f"/api/reagents/{other_id}")
 
+# ---------- 14. 待加试剂插入位置评估（逐位置预演 / 推荐 / 规则版本 / 不落库 / 错误路径） ----------
+print("【场景14】待加试剂插入位置评估")
+s, reagents = call("GET", "/api/reagents")
+kcn = next(x for x in reagents if x["name"] == "氰化钾")
+hcl = next(x for x in reagents if x["name"] == "盐酸")
+nacl = next(x for x in reagents if x["name"] == "氯化钠")
+runs_before_plc = len(call("GET", "/api/runs")[1])
+plans_before_plc = len(call("GET", "/api/plans")[1])
+
+# 评估方案：氰化钾 → 氢氧化钠（强碱）→ 水；候选 盐酸（强酸，与氰化物 high、与强碱 medium）
+s, pp = call("POST", "/api/plans", {"name": "测试-插入位置", "steps": [
+    {"order_index": 0, "reagent_id": kcn["id"], "amount_ml": 10},
+    {"order_index": 1, "reagent_name": "强碱液", "categories": ["strong_base"], "amount_ml": 20},
+    {"order_index": 2, "reagent_name": "水P", "categories": [], "amount_ml": 100},
+]})
+plc_pid = pp["id"]
+check("创建评估方案", s == 201 and len(pp["steps"]) == 3, (s, pp))
+
+s, r = call("POST", f"/api/plans/{plc_pid}/placement-preview",
+            {"reagent_name": "新盐酸", "categories": ["strong_acid"], "amount_ml": 15, "note": "滴加"})
+check("位置评估 200", s == 200 and r["kind"] == "labmix-placement-preview", (s, r))
+check("N+1=4 个位置（首位/间隙/末尾）", r["position_count"] == 4
+      and [p["position"] for p in r["positions"]] == [0, 1, 2, 3], r.get("positions"))
+check("位置标签完整", [p["label"] for p in r["positions"]] == [
+    "首位（第 1 步之前）", "第 1 步与第 2 步之间",
+    "第 2 步与第 3 步之间", "末尾（第 3 步之后）"],
+    [p["label"] for p in r["positions"]])
+check("无生效版本时用全局规则图", r["rule_scope"] == "global" and bool(r["rule_revision"]),
+      (r.get("rule_scope"), r.get("rule_revision")))
+check("回显候选试剂与正数用量", r["candidate"]["name"] == "新盐酸"
+      and r["candidate"]["categories"] == ["strong_acid"]
+      and r["candidate"]["amount_ml"] == 15 and r["candidate"]["note"] == "滴加", r["candidate"])
+
+p0, p1, p2, p3 = r["positions"]
+# 首位：候选盐酸先加入（安全），原第1步氰化钾后加入时命中 R001 high
+check("首位：原氰化钾步骤触发 R001", p0["has_danger"] is True
+      and p0["first_danger"]["rule_id"] == "R001"
+      and p0["first_danger"]["step_is_inserted"] is False
+      and p0["first_danger"]["step_original"] == 0
+      and p0["first_danger"]["conflicts_with_is_inserted"] is True
+      and p0["first_danger"]["conflicts_with_step_original"] is None, p0["first_danger"])
+check("首位阻断原步骤 [1,2]", p0["blocked_original_steps"] == [1, 2]
+      and p0["executed_original_count"] == 1, p0)
+# 中间：候选在氰化钾之后加入，候选自身触发 high
+check("第1间隙：候选自身触发 R001", p1["has_danger"] is True
+      and p1["first_danger"]["step_is_inserted"] is True
+      and p1["first_danger"]["conflicts_with_step_original"] == 0
+      and p1["first_danger"]["conflicts_with_reagent"] == "氰化钾", p1["first_danger"])
+check("第1间隙阻断原步骤 [1,2]", p1["blocked_original_steps"] == [1, 2], p1)
+# 第 2 间隙（氰化钾、强碱之后）：前序两步安全，候选盐酸加入即对氰化钾触发 R001，
+# 仅最后的原步骤「水」被阻断 → 与末尾并列、阻断原步骤最少
+check("第2间隙候选加入即触发 R001，仅阻断原步骤 [2]",
+      p2["inserted_state"] == "danger"
+      and p2["first_danger"]["step_is_inserted"] is True
+      and p2["blocked_original_steps"] == [2],
+      (p2["inserted_state"], p2["blocked_original_steps"]))
+# 末尾：原 3 步全部先执行（候选在最后），候选盐酸加入时才触发 R001——
+# 没有原步骤被阻断（3/3 可执行），因此在"未被阻断原步骤最多"准则下最优
+check("末尾位置无原步骤被阻断（候选自身危险）", p3["has_danger"] is True
+      and p3["inserted_state"] == "danger"
+      and p3["blocked_original_steps"] == []
+      and p3["executed_original_count"] == 3, p3)
+# 全有 high → 未被阻断原步骤最多（阻断最少）= 末尾位置 3
+check("全有 high：推荐未被阻断原步骤最多的末尾位置 3",
+      r["recommended"]["position"] == 3 and r["recommended"]["has_danger"] is True
+      and r["recommended"]["blocked_original_count"] == 0, r["recommended"])
+check("推荐含排序依据", r["recommended"]["rank_basis"]["rule"]
+      == "no_danger > max_unblocked_original > fewer_warnings > earlier_position"
+      and r["recommended"]["rank_basis"]["executed_original_count"] == 3,
+      r["recommended"]["rank_basis"])
+check("推荐理由可读", "阻断" in r["recommended"]["reason"], r["recommended"]["reason"])
+
+# 决胜补充：方案 [氰化钾, 水, 水]，候选强酸——阻断原步骤数依次 2/1/0，
+# 仍按"未被阻断原步骤最多"选末尾；进一步的阻断数并列由排序键（警示少→位置靠前）保证
+s, pt = call("POST", "/api/plans", {"name": "测试-插入决胜", "steps": [
+    {"order_index": 0, "reagent_name": "氰化钾A", "categories": ["cyanide"], "amount_ml": 1},
+    {"order_index": 1, "reagent_name": "水T", "categories": [], "amount_ml": 1},
+    {"order_index": 2, "reagent_name": "水T2", "categories": [], "amount_ml": 1},
+]})
+ptid = pt["id"]
+# 候选类别同时含 strong_acid：位置 0 候选先入→氰化钾A 加入时 high（阻断 [1,2]）；
+# 位置 1/2/3 候选遇氰化钾 high：阻断分别为 [1,2]/[2]/[]
+s, rt = call("POST", f"/api/plans/{ptid}/placement-preview",
+             {"reagent_name": "酸T", "categories": ["strong_acid"], "amount_ml": 1})
+check("决胜：阻断数最少的末尾胜出", rt["recommended"]["position"] == 3
+      and rt["recommended"]["blocked_original_count"] == 0, rt["recommended"])
+call("DELETE", f"/api/plans/{ptid}")
+# 命中依据完整：含类别对 / 方向 / 方程式 / 机理 / 文献
+fd0 = p0["findings"][0]
+check("命中依据可追溯", fd0["rule_id"] == "R001" and fd0["incoming_category"] == "cyanide"
+      and fd0["existing_category"] == "strong_acid"
+      and "HCN" in fd0["reaction"] and fd0["rationale"] and fd0["references"], fd0)
+check("位置结果带逐步时间轴", len(p1["timeline"]) == 4
+      and [t["is_inserted"] for t in p1["timeline"]].count(True) == 1
+      and any(t["original_order_index"] == 1 for t in p1["timeline"]), p1["timeline"])
+
+# 安全候选（氯化钠，halide_salt）：所有位置无 high，推荐警示最少、位置最靠前 = 0
+s, r2 = call("POST", f"/api/plans/{plc_pid}/placement-preview",
+             {"reagent_id": nacl["id"], "amount_ml": 50})
+check("档案试剂评估 200", s == 200, (s, r2))
+check("安全候选：全部位置无 high", all(not p["has_danger"] for p in r2["positions"]),
+      [(p["position"], p["has_danger"]) for p in r2["positions"]])
+check("无 high 时推荐首位（警示最少、最靠前）",
+      r2["recommended"]["position"] == 0 and r2["recommended"]["has_danger"] is False,
+      r2["recommended"])
+
+# medium-only 候选（强碱）插入 氰化钾→水 方案：候选与方案无 high，全部无危险
+s, pm = call("POST", "/api/plans", {"name": "测试-插入警示", "steps": [
+    {"order_index": 0, "reagent_id": kcn["id"], "amount_ml": 10},
+    {"order_index": 1, "reagent_name": "水M", "categories": [], "amount_ml": 100},
+]})
+pmid = pm["id"]
+s, r3 = call("POST", f"/api/plans/{pmid}/placement-preview",
+             {"reagent_name": "强碱液M", "categories": ["strong_base"], "amount_ml": 5})
+check("无 high 候选各位置不中止", s == 200 and all(p["status"] != "danger" for p in r3["positions"]),
+      [(p["position"], p["status"]) for p in r3["positions"]])
+check("推荐首位", r3["recommended"]["position"] == 0, r3["recommended"])
+
+# 空方案：只有一个位置
+s, pe = call("POST", "/api/plans", {"name": "测试-插入空方案", "steps": []})
+peid = pe["id"]
+s, r4 = call("POST", f"/api/plans/{peid}/placement-preview",
+             {"reagent_name": "水E", "categories": [], "amount_ml": 1})
+check("临时试剂无类别 → 422", s == 422, (s, r4))
+s, r4 = call("POST", f"/api/plans/{peid}/placement-preview",
+             {"reagent_name": "盐E", "categories": ["halide_salt"], "amount_ml": 1})
+check("空方案只有首位一个位置", s == 200 and r4["position_count"] == 1
+      and r4["positions"][0]["label"] == "首位（第 1 步之前）", (s, r4.get("positions")))
+
+# 规则版本：发布一个把 R001 降为 medium 的版本后，评估应读取版本快照
+s, pv = call("POST", f"/api/plans/{plc_pid}/rule-versions", {"note": "plc 测试"})
+plv = pv["id"]
+edited = pv["rules"]
+for x in edited:
+    if x["id"] == "R001":
+        x["severity"] = "medium"
+s, _ = call("PUT", f"/api/plans/{plc_pid}/rule-versions/{plv}", {"rules": edited})
+check("编辑评估方案版本", s == 200, s)
+s, _ = call("POST", f"/api/plans/{plc_pid}/rule-versions/{plv}/publish")
+check("发布评估方案版本", s == 200, s)
+s, r5 = call("POST", f"/api/plans/{plc_pid}/placement-preview",
+             {"reagent_name": "新盐酸", "categories": ["strong_acid"], "amount_ml": 15})
+check("评估沿用方案当前生效版本", s == 200 and r5["rule_scope"] == "plan_version"
+      and r5["rule_revision"] == f"plan{plc_pid}-rv1", (s, r5.get("rule_scope")))
+# R001 降级后强酸不再触发 high（强碱×强酸的 R014 为 medium），各位置不中止
+check("版本快照下候选不再触发 high", all(not p["has_danger"] for p in r5["positions"]),
+      [(p["position"], p["has_danger"], p["finding_counts"]) for p in r5["positions"]])
+check("此时推荐首位", r5["recommended"]["position"] == 0, r5["recommended"])
+
+# 错误路径
+s, e = call("POST", "/api/plans/999999/placement-preview",
+            {"reagent_name": "x", "categories": ["c"], "amount_ml": 1})
+check("方案不存在 404", s == 404, s)
+s, e = call("POST", f"/api/plans/{plc_pid}/placement-preview",
+            {"reagent_id": 999999, "amount_ml": 1})
+check("档案试剂不存在 404", s == 404, s)
+s, e = call("POST", f"/api/plans/{plc_pid}/placement-preview", {"amount_ml": 1})
+check("既无档案也无名称 422", s == 422 and "试剂" in e["detail"], (s, e))
+s, e = call("POST", f"/api/plans/{plc_pid}/placement-preview",
+            {"reagent_name": "x", "categories": [], "amount_ml": 1})
+check("临时试剂类别为空 422", s == 422 and "类别" in e["detail"], (s, e))
+s, e = call("POST", f"/api/plans/{plc_pid}/placement-preview",
+            {"reagent_id": hcl["id"], "reagent_name": "x", "categories": ["c"], "amount_ml": 1})
+check("档案与临时试剂同填 422", s == 422, (s, e))
+s, e = call("POST", f"/api/plans/{plc_pid}/placement-preview",
+            {"reagent_name": "x", "categories": ["c"], "amount_ml": 0})
+check("用量为 0 → 422", s == 422, s)
+s, e = call("POST", f"/api/plans/{plc_pid}/placement-preview",
+            {"reagent_name": "x", "categories": ["c"], "amount_ml": -5})
+check("用量为负 → 422", s == 422, s)
+s, e = call("POST", f"/api/plans/{plc_pid}/placement-preview",
+            {"reagent_name": "   ", "categories": ["c"], "amount_ml": 1})
+check("名称全空白 → 422", s == 422, s)
+s, e = call("POST", f"/api/plans/{plc_pid}/placement-preview",
+            {"reagent_name": "x", "categories": ["  ", ""], "amount_ml": 1})
+check("类别全空白 → 422", s == 422 and "类别" in e["detail"], (s, e))
+
+# 纯预览：不新增推演记录、不新增/改动方案步骤
+check("评估不落库（推演记录数不变）",
+      len(call("GET", "/api/runs")[1]) == runs_before_plc)
+plan_after = call("GET", f"/api/plans/{plc_pid}")[1]
+check("评估不改动方案步骤（仍 3 步）", len(plan_after["steps"]) == 3
+      and [s2["reagent_name"] for s2 in plan_after["steps"]] != ["新盐酸"],
+      len(plan_after["steps"]))
+check("评估不新增方案", len(call("GET", "/api/plans")[1]) == plans_before_plc + 3)
+
+for d in (plc_pid, pmid, peid):
+    call("DELETE", f"/api/plans/{d}")
+
 print(f"\n结果：{PASS} 通过，{FAIL} 失败")
 sys.exit(1 if FAIL else 0)

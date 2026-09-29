@@ -228,8 +228,61 @@ class RuleVersionUpdate(BaseModel):
     rules: Optional[list[VersionRuleIn]] = None
 
 
-# ---------- 废液分桶规划 ----------
+# ---------- 待加试剂插入位置评估（预览） ----------
 
+class PlacementPreviewIn(BaseModel):
+    """已保存方案中评估一股待加试剂的最佳插入位置（仅预演不落库）。
+
+    两种试剂来源二选一：
+    - reagent_id：使用试剂档案（类别按档案实时解析）；
+    - reagent_name + 非空 categories：临时试剂。
+    amount_ml 必须为正数。
+    """
+
+    reagent_id: Optional[int] = None
+    reagent_name: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    categories: Optional[list[str]] = None
+    amount_ml: float = Field(gt=0, le=1_000_000)
+    note: Optional[str] = Field(default=None, max_length=500)
+
+    @field_validator("reagent_name")
+    @classmethod
+    def _strip_name(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("categories")
+    @classmethod
+    def _clean_categories(cls, value):
+        if value is None:
+            return None
+        out: list[str] = []
+        for item in value:
+            key = str(item).strip()[:64]
+            if key and key not in out:
+                out.append(key)
+        return out
+
+    @field_validator("note")
+    @classmethod
+    def _strip_note(cls, value):
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+    def validate_source(self) -> None:
+        """业务校验：档案 / 临时试剂二选一，且临时试剂类别非空。"""
+        has_id = self.reagent_id is not None
+        has_name = bool(self.reagent_name)
+        if has_id and has_name:
+            raise ValueError("试剂档案与临时试剂名只能填写一种（reagent_id 与 reagent_name 二选一）")
+        if not has_id and not has_name:
+            raise ValueError("必须选择档案试剂（reagent_id）或填写临时试剂名（reagent_name）")
+        if not has_id and not self.categories:
+            raise ValueError("临时试剂必须填写至少一个非空类别（categories）")
+
+
+# ---------- 废液分桶规划 ----------
 class WasteStreamIn(BaseModel):
     """一股废液：档案试剂 + 体积（mL）。"""
 

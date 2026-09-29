@@ -605,3 +605,81 @@ textarea { resize: vertical; }
   .merge-sides { flex-direction: column; }
   .merge-arrow { transform: rotate(90deg); }
 }
+
+/* ---------- 待加试剂插入位置评估 ---------- */
+.plc-steps {
+  list-style: none;
+  margin: 10px 0 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg);
+  max-height: 160px;
+  overflow: auto;
+}
+.plc-step {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 3px 0;
+}
+.plc-step .step-idx {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--brand-soft);
+  color: var(--brand-dark);
+  font-size: 12px;
+  font-weight: 700;
+  flex: 0 0 auto;
+}
+.plc-step-name { font-weight: 600; }
+.plc-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}
+.plc-card {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  background: var(--panel);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.plc-card.plc-rec {
+  border: 2px solid var(--ok);
+  background: var(--ok-bg);
+  box-shadow: 0 0 0 3px rgba(22, 163, 74, .12);
+}
+.plc-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.plc-pos-label { font-weight: 700; }
+.plc-danger {
+  border-left: 3px solid var(--high);
+  background: var(--high-bg);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 13px;
+}
+.plc-blocked { line-height: 1.5; }
+.plc-card .plc-detail { align-self: flex-start; margin-top: auto; }
+.plc-findings {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  border-left: 3px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}

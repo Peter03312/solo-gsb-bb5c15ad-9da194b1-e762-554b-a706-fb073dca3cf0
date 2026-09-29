@@ -5,10 +5,18 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
-from .. import models, safety, versioning
+from .. import models, placement, safety, versioning
 from ..database import get_db
-from ..deduce import _step_categories, build_report, persist_run
-from ..schemas import PlanCreate, PlanOut, PlanUpdate, StepOut, StepSafetyUpdate
+from ..deduce import _step_categories, build_report, persist_run, plan_to_input, resolve_rule_source
+from ..schemas import (
+    PlacementPreviewIn,
+    PlanCreate,
+    PlanOut,
+    PlanUpdate,
+    StepOut,
+    StepSafetyUpdate,
+)
+from ..engine import InputReagent
 
 router = APIRouter(prefix="/api/plans", tags=["plans"])
 
@@ -209,6 +217,67 @@ def simulate_dry(plan_in: PlanCreate, db: Session = Depends(get_db)):
     report, _ = build_report(db, plan)
     report["plan_id"] = None
     return report
+
+
+@router.post("/{plan_id}/placement-preview")
+def placement_preview(
+    plan_id: int,
+    payload: PlacementPreviewIn,
+    db: Session = Depends(get_db),
+):
+    """评估一股待加试剂插在已保存方案的哪个位置更合适（纯预览，不落库）。
+
+    对**首位、相邻步骤之间、末尾**共 N+1 个位置逐一预演：沿用该方案当前生效
+    规则版本（没有时使用全局启用规则图），按既有有向 / 无向类别匹配与
+    "首次 high 即中止"口径推演；每个位置返回首次危险、被阻断的原步骤及
+    命中依据，并给出推荐位次。
+
+    - 推荐：先选无 high 的位置；全部有 high 时选未被阻断的原步骤最多者，
+      其余按警示命中数少、位置靠前决胜；
+    - 结果只作预览：**不保存步骤、不写推演记录、不要求安全确认**；
+    - 方案不存在 → 404；档案 / 临时试剂填写矛盾、类别为空、用量非正 → 422；
+      引用的档案试剂不存在 → 404。
+    """
+    try:
+        payload.validate_source()
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+
+    plan = db.get(models.Plan, plan_id)
+    if plan is None:
+        raise HTTPException(404, "方案不存在")
+
+    if payload.reagent_id is not None:
+        reagent = db.get(models.Reagent, payload.reagent_id)
+        if reagent is None:
+            raise HTTPException(404, f"试剂 id={payload.reagent_id} 不存在")
+        candidate = InputReagent(
+            name=reagent.name,
+            categories=json.loads(reagent.categories or "[]"),
+        )
+    else:
+        candidate = InputReagent(
+            name=payload.reagent_name,
+            categories=payload.categories or [],
+        )
+
+    # 当前生效规则版本（published 快照）；没有生效版本时回落全局启用规则图
+    rules, revision, _, scope = resolve_rule_source(db, plan)
+    base_steps = plan_to_input(db, plan)
+    result = placement.evaluate_placement(
+        base_steps, candidate, payload.amount_ml, payload.note, rules, revision
+    )
+    result["plan_id"] = plan.id
+    result["plan_name"] = plan.name
+    result["rule_scope"] = scope
+    result["candidate"] = {
+        "reagent_id": payload.reagent_id,
+        "name": candidate.name,
+        "categories": candidate.categories,
+        "amount_ml": payload.amount_ml,
+        "note": payload.note,
+    }
+    return result
 
 
 @router.put("/{plan_id}/steps/{step_id}/safety")

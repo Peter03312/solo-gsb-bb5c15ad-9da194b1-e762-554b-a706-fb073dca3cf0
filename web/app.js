@@ -519,6 +519,7 @@ function renderPlanList() {
       actions.append(
         actionBtn("编辑", "btn-small", () => editPlan(p)),
         actionBtn("⚡ 推演", "btn-small btn-primary", () => simulatePlan(p).catch((e) => toast(e.message, true))),
+        actionBtn("🧭 插入评估", "btn-small", () => openPlacementModal(p)),
         actionBtn("📦 规则版本", "btn-small", () => openPlanVersions(p)),
         actionBtn("导出 JSON", "btn-small", () => exportPlan(p.id)),
         actionBtn("删除", "btn-small btn-danger", () => removePlan(p)),
@@ -739,6 +740,229 @@ function syncImportCommitBtn() {
 }
 
 $("#btnOpenImport").addEventListener("click", openImportModal);
+
+/* ---------------- 待加试剂插入位置评估（预览不落库） ---------------- */
+
+function openPlacementModal(plan) {
+  const stepsHtml = plan.steps.length
+    ? plan.steps.map((s, i) => `
+        <li class="plc-step">
+          <span class="step-idx">${i + 1}</span>
+          <span class="plc-step-name">${escapeHtml(s.reagent_name)}</span>
+          <span class="item-meta">${(s.categories || []).map((c) => escapeHtml(catLabel(c))).join(" / ") || "（无类别）"}</span>
+        </li>`).join("")
+    : '<li class="item"><div class="item-meta">该方案暂无步骤：评估只会给出「首位」一个位置。</div></li>';
+  openModal(`
+    <button class="btn btn-ghost modal-close">✕ 关闭</button>
+    <h3>🧭 待加试剂插入位置评估</h3>
+    <p class="hint">在已保存方案 <b>「${escapeHtml(plan.name)}」</b> 的首位、相邻步骤之间与末尾
+      共 <b>${plan.steps.length + 1}</b> 个位置逐一预演一股待加试剂，沿用方案
+      <b>${plan.effective_rule_version ? `当前生效规则版本 v${plan.effective_rule_version.version_no}` : "全局启用规则图"}</b>
+      及既有"首次 high 即中止"口径。<b>仅预览：不保存步骤、不写推演记录、不要求安全确认。</b></p>
+    <ul class="plc-steps">${stepsHtml}</ul>
+    <div class="form">
+      <label>待加试剂来源
+        <select id="plcSource">
+          <option value="archive">试剂档案</option>
+          <option value="temp">临时试剂（手填名称 + 类别）</option>
+        </select>
+      </label>
+      <div id="plcArchiveBox">
+        <label>选择档案试剂
+          <select id="plcReagentId"><option value="">— 选择试剂档案 —</option>
+            ${state.reagents.map((r) => `<option value="${r.id}">${escapeHtml(r.name)}${r.categories.length ? `（${r.categories.map((c) => escapeHtml(catLabel(c))).join("/")}）` : ""}</option>`).join("")}
+          </select>
+        </label>
+      </div>
+      <div id="plcTempBox" class="hidden">
+        <div class="form-row">
+          <label>临时试剂名<input type="text" id="plcName" maxlength="128" placeholder="如：新配制王水" /></label>
+          <label>用量 (mL/g)<input type="number" id="plcAmountT" min="0" step="0.1" placeholder="如 20" /></label>
+        </div>
+        <label>相容性类别（逗号分隔，至少一个）
+          <input type="text" id="plcCats" placeholder="如 strong_acid, oxidizer" />
+        </label>
+      </div>
+      <div id="plcArchiveAmtBox">
+        <label>用量 (mL/g)<input type="number" id="plcAmountA" min="0" step="0.1" placeholder="如 20" /></label>
+      </div>
+      <label>备注（可选）<input type="text" id="plcNote" maxlength="500" placeholder="该次加液的操作备注" /></label>
+      <div class="form-actions">
+        <button type="button" class="btn btn-primary" id="btnPlcEval">🧮 逐一预演全部位置</button>
+      </div>
+    </div>
+    <div id="plcResult"></div>
+  `);
+  $("#modalBox").classList.add("modal-wide");
+
+  $("#plcSource").addEventListener("change", (e) => {
+    const isArchive = e.target.value === "archive";
+    $("#plcArchiveBox").classList.toggle("hidden", !isArchive);
+    $("#plcArchiveAmtBox").classList.toggle("hidden", !isArchive);
+    $("#plcTempBox").classList.toggle("hidden", isArchive);
+  });
+  $("#btnPlcEval").addEventListener("click", () => requestPlacement(plan));
+}
+
+async function requestPlacement(plan) {
+  const isArchive = $("#plcSource").value === "archive";
+  const note = $("#plcNote").value.trim() || null;
+  let body;
+  if (isArchive) {
+    const reagentId = Number($("#plcReagentId").value);
+    const amount = Number($("#plcAmountA").value);
+    if (!reagentId) { toast("请选择档案试剂", true); return; }
+    if (!(amount > 0)) { toast("请填写正数用量", true); return; }
+    body = { reagent_id: reagentId, amount_ml: amount, note };
+  } else {
+    const name = $("#plcName").value.trim();
+    const cats = $("#plcCats").value.split(/[,，、；;]/).map((s) => s.trim()).filter(Boolean);
+    const amount = Number($("#plcAmountT").value);
+    if (!name) { toast("请填写临时试剂名", true); return; }
+    if (!cats.length) { toast("临时试剂必须填写至少一个类别", true); return; }
+    if (!(amount > 0)) { toast("请填写正数用量", true); return; }
+    body = { reagent_name: name, categories: cats, amount_ml: amount, note };
+  }
+  const btn = $("#btnPlcEval");
+  btn.disabled = true;
+  try {
+    const result = await api(`/api/plans/${plan.id}/placement-preview`, { method: "POST", body });
+    renderPlacementResult(result);
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function plcStateBadge(pos) {
+  if (pos.has_danger) return '<span class="badge badge-high">🛑 严重中止</span>';
+  if (pos.status === "warning") return '<span class="badge badge-medium">⚠️ 存在警示</span>';
+  return '<span class="badge badge-ok">✅ 无危险</span>';
+}
+
+function renderPlacementResult(r) {
+  const box = $("#plcResult");
+  if (!box) return;
+  const rec = r.recommended;
+  const candCats = (r.candidate.categories || []).map((c) => `<span class="badge badge-low">${escapeHtml(catLabel(c))}</span>`).join(" ") || '<span class="item-meta">（无类别）</span>';
+  const scopeLine = r.rule_scope === "plan_version"
+    ? `方案规则版本 <b>${escapeHtml(r.rule_revision)}</b>`
+    : `全局启用规则图 ${escapeHtml(r.rule_revision)}`;
+
+  const cards = r.positions.map((p) => {
+    const isRec = p.position === rec.position;
+    const fd = p.first_danger;
+    let dangerHtml = "";
+    if (fd) {
+      const conflictStep = fd.conflicts_with_is_inserted
+        ? "待加试剂自身（前序）"
+        : `原第 ${fd.conflicts_with_step_original + 1} 步「${escapeHtml(fd.conflicts_with_reagent)}」`;
+      const atStep = fd.step_is_inserted
+        ? "待加试剂加入时"
+        : `原第 ${fd.step_original + 1} 步「${escapeHtml(fd.reagent_name)}」`;
+      dangerHtml = `
+        <div class="plc-danger">
+          🛑 首次危险：${atStep}，与 ${conflictStep} 冲突
+          <span class="badge badge-high">[${escapeHtml(fd.rule_id)}] ${escapeHtml(fd.title)}</span>
+          <div class="item-meta">${escapeHtml(fd.reaction)}</div>
+        </div>`;
+    }
+    const blockedHtml = p.blocked_original_steps.length
+      ? `⛔ 被阻断原步骤：${p.blocked_original_steps.map((s) => `第 ${s + 1} 步`).join("、")}
+         （共 ${p.blocked_original_count} 个；${p.executed_original_count}/${r.original_step_count} 个原步骤可执行）`
+      : (p.has_danger
+          ? `⛔ 待加试剂自身未安全加入，但 <b>${r.original_step_count}/${r.original_step_count}</b> 个原步骤均不被阻断`
+          : `✅ 无阻断（${r.original_step_count}/${r.original_step_count} 个原步骤均可执行）`);
+    const warnBadges = [];
+    if (p.finding_counts.high) warnBadges.push(`<span class="badge badge-high">严重 ${p.finding_counts.high}</span>`);
+    if (p.finding_counts.medium) warnBadges.push(`<span class="badge badge-medium">警示 ${p.finding_counts.medium}</span>`);
+    if (p.finding_counts.low) warnBadges.push(`<span class="badge badge-low">提示 ${p.finding_counts.low}</span>`);
+    return `
+      <div class="plc-card ${isRec ? "plc-rec" : ""}" data-pos="${p.position}">
+        <div class="plc-card-head">
+          <span class="plc-pos-label">${isRec ? "⭐ " : ""}${escapeHtml(p.label)}</span>
+          ${plcStateBadge(p)}
+          ${isRec ? '<span class="badge badge-ok">推荐位置</span>' : ""}
+        </div>
+        <div class="item-meta">待加试剂结果：${escapeHtml(p.inserted_state_label)} ${warnBadges.join(" ")}</div>
+        ${dangerHtml}
+        <div class="item-meta plc-blocked">${blockedHtml}</div>
+        <button type="button" class="btn btn-small plc-detail">🔎 查看逐步推演与命中依据</button>
+      </div>`;
+  }).join("");
+
+  box.innerHTML = `
+    <div class="report-banner ${rec.has_danger ? "warning" : "safe"}">
+      <span class="big">${rec.has_danger ? "⚠️" : "⭐"}</span>
+      <div style="flex:1">
+        <h2>推荐位置：${escapeHtml(rec.label)}</h2>
+        <p>${escapeHtml(rec.reason)}</p>
+        <p class="item-meta">待加试剂 <b>${escapeHtml(r.candidate.name)}</b>（${r.candidate.amount_ml} mL/g）${candCats}
+          · ${scopeLine} · 共评估 ${r.position_count} 个位置 · 预览不落库</p>
+      </div>
+    </div>
+    <div class="plc-cards">${cards}</div>`;
+
+  $$(".plc-card", box).forEach((card) => {
+    card.querySelector(".plc-detail").addEventListener("click", () => {
+      const pos = r.positions.find((x) => x.position === Number(card.dataset.pos));
+      openPlacementDetailModal(pos, r);
+    });
+  });
+}
+
+function openPlacementDetailModal(pos, r) {
+  const candName = r.candidate.name;
+  const tlHtml = pos.timeline.map((t) => {
+    const tag = t.is_inserted
+      ? '<span class="badge badge-ok">待加试剂</span>'
+      : `<span class="item-meta">原第 ${t.original_order_index + 1} 步</span>`;
+    const fidHtml = t.finding_ids.map((fid) => {
+      const f = pos.findings.find((x) => x.id === fid);
+      if (!f) return "";
+      const who = f.incoming_is_inserted
+        ? "待加试剂加入"
+        : `原第 ${f.incoming_step_original + 1} 步加入`;
+      const other = f.existing_is_inserted
+        ? "待加试剂"
+        : `原第 ${f.existing_step_original + 1} 步「${escapeHtml(f.existing_reagent)}」`;
+      return `<li><span class="badge badge-${f.severity}">${escapeHtml(f.severity_label)}</span>
+        <b>[${escapeHtml(f.rule_id)}]</b> ${escapeHtml(f.title)} —— ${who}，与体系中 ${other}
+        （${escapeHtml(catLabel(f.incoming_category))} × ${escapeHtml(catLabel(f.existing_category))}，
+        ${f.rule_directional ? "有向" : "无向"}）<div class="item-meta">${escapeHtml(f.reaction)}</div>
+        <div class="item-meta">${escapeHtml(f.rationale)}</div>
+        <ul class="m-refs">${(f.references || []).map((x) => `<li>· ${escapeHtml(x)}</li>`).join("") || ""}</ul>
+      </li>`;
+    }).join("");
+    return `
+      <li class="tl-item ${t.state}">
+        <span class="tl-dot"></span>
+        <div class="tl-body">
+          <div class="tl-head">
+            <span class="tl-name">${escapeHtml(t.reagent_name)} ${tag}</span>
+            <span class="badge badge-${t.state === "ok" ? "ok" : t.state}">${t.state_label}</span>
+          </div>
+          ${fidHtml ? `<ul class="plc-findings">${fidHtml}</ul>` : ""}
+        </div>
+      </li>`;
+  }).join("");
+
+  openModal(`
+    <button class="btn btn-ghost modal-close">✕ 关闭</button>
+    <h3>🔎 ${escapeHtml(pos.label)} · 逐步预演</h3>
+    <p class="hint">待加试剂 <b>${escapeHtml(candName)}</b>（${r.candidate.amount_ml} mL/g）插入后的完整推演；
+      ${r.rule_scope === "plan_version" ? `方案规则版本 ${escapeHtml(r.rule_revision)}` : `全局启用规则图 ${escapeHtml(r.rule_revision)}`}。
+      原步骤编号按插入前的方案序号展示。</p>
+    <ul class="timeline">${tlHtml}</ul>
+    <p class="item-meta">命中统计：
+      <span class="badge badge-high">严重 ${pos.finding_counts.high}</span>
+      <span class="badge badge-medium">警示 ${pos.finding_counts.medium}</span>
+      <span class="badge badge-low">提示 ${pos.finding_counts.low}</span>
+      · 被阻断原步骤 ${pos.blocked_original_count} 个</p>
+  `);
+  $("#modalBox").classList.add("modal-wide");
+}
 
 /* ---------------- 废液分桶规划 ---------------- */
 

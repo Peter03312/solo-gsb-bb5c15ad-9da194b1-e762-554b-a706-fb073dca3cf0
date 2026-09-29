@@ -28,7 +28,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="实验室配液相容性推演台",
     description="录入试剂属性与按时间排列的加液步骤，基于可维护规则图逐步推演相容性。",
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
