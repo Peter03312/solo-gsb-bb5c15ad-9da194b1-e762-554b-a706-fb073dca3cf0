@@ -1029,5 +1029,131 @@ call("DELETE", f"/api/plans/{merge_plan}")
 call("DELETE", f"/api/reagents/{merge_tgt}")
 call("DELETE", f"/api/reagents/{other_id}")
 
+# ---------- 14. 待加试剂插入位置评估（纯预览，不落库） ----------
+print("【场景14】待加试剂插入位置评估")
+
+# 方案①：氰化钾 -> 盐酸 -> 乙醇（基线在第 2 步 R001 中止，第 3 步阻断）
+s, r = call("POST", "/api/plans/1/insertion-preview", {"reagent_id": 1, "amount_ml": 15})
+check("插入评估 200", s == 200 and r["kind"] == "labmix-insertion-preview", (s, r))
+check("候选数=N+1=4 个位置", len(r["positions"]) == 4 and r["position_count"] == 4, r.get("position_count"))
+check("沿用全局规则图", r["rule_scope"] == "global" and r["rule_revision"], r.get("rule_scope"))
+check("基线首次危险/阻断正确", r["baseline"]["halted"] is True
+      and r["baseline"]["first_danger"]["rule_id"] == "R001"
+      and r["baseline"]["blocked_steps"] == [2], r["baseline"])
+# 盐酸候选：首位会让原第1步氰化钾先触发 high；中间候选自身触发；末尾候选被阻断——无安全位置
+safe_pos = [p["position"] for p in r["positions"] if p["candidate_safe"]]
+check("盐酸处处不安全", safe_pos == [], safe_pos)
+check("推荐 tier=least_blocked 且位置为 2", r["recommendation"]["tier"] == "least_blocked"
+      and r["recommendation"]["position"] == 2, r["recommendation"])
+rec2 = next(p for p in r["positions"] if p["position"] == 2)
+check("推荐位置被阻断原步骤最少(=1 个:原第3步)", rec2["blocked_original_steps"] == [2]
+      and rec2["executed_original_step_count"] == 2, rec2)
+p0 = next(p for p in r["positions"] if p["position"] == 0)
+check("首位首次危险映射为原步骤并指明候选为冲突方",
+      p0["first_danger"]["step_kind"] == "original" and p0["first_danger"]["step"] == 0
+      and p0["first_danger"]["conflicts_with_kind"] == "candidate"
+      and p0["first_danger"]["rule_id"] == "R001", p0["first_danger"])
+check("命中依据完整可追溯", all(k in p0["first_danger"] for k in
+      ["reaction", "rationale", "references", "incoming_category", "existing_category",
+       "match_direction", "rule_directional"]), p0["first_danger"])
+p1 = next(p for p in r["positions"] if p["position"] == 1)
+check("中间位置首次危险发生在候选步骤", p1["first_danger"]["step_kind"] == "candidate"
+      and p1["first_danger"]["step"] is None and p1["candidate_first_danger"] is True, p1["first_danger"])
+check("候选命中列出 R001 high", any(f["rule_id"] == "R001" and f["severity"] == "high"
+      for f in p1["candidate_findings"]), p1["candidate_findings"])
+
+# 无害候选（氯化钠）：首位/次位可安全加入，推荐位置最靠前的 0
+s, r = call("POST", "/api/plans/1/insertion-preview", {"reagent_id": 22, "amount_ml": 5})
+check("氯化钠推荐 no_high 且位置=0", r["recommendation"]["tier"] == "no_high"
+      and r["recommendation"]["position"] == 0, r["recommendation"])
+safe_pos = [p["position"] for p in r["positions"] if p["candidate_safe"]]
+check("安全位置为 0/1（中止点之后候选被阻断）", safe_pos == [0, 1], safe_pos)
+
+# 新建安全方案 [盐酸, 氯化钠]，候选氢氧化钠：无向 R014 中和警示处处 1 条，仍按靠前推荐 pos0
+s, wp = call("POST", "/api/plans", {"name": "测试-插入评估决胜", "steps": [
+    {"order_index": 0, "reagent_id": 1, "amount_ml": 100},
+    {"order_index": 1, "reagent_id": 22, "amount_ml": 50},
+]})
+ins_plan = wp["id"]
+s, r = call("POST", f"/api/plans/{ins_plan}/insertion-preview", {"reagent_id": 4, "amount_ml": 10})
+check("警示不影响安全判定且推荐首位", r["recommendation"]["position"] == 0
+      and all(p["candidate_safe"] for p in r["positions"]), r["recommendation"])
+check("各位置含 1 条 R014 medium 命中", all(
+    any(f["rule_id"] == "R014" and f["severity"] == "medium" for f in p["candidate_findings"])
+    for p in r["positions"]), r["positions"])
+
+# 有向 medium 规则：X 加入含 Y 体系才命中——首位无警示、其后有，推荐首位
+s, _ = call("POST", "/api/rules", {
+    "id": "C020", "source": "ins_cat_x", "target": "ins_cat_y", "directional": True,
+    "severity": "medium", "title": "插入评估有向警示", "reaction": "X+Y",
+    "rationale": "方向测试", "references": []})
+s, dp = call("POST", "/api/plans", {"name": "测试-插入评估有向", "steps": [
+    {"order_index": 0, "reagent_name": "Y", "categories": ["ins_cat_y"], "amount_ml": 1},
+    {"order_index": 1, "reagent_name": "Z", "categories": ["ins_cat_z"], "amount_ml": 1},
+]})
+dir_plan = dp["id"]
+s, r = call("POST", f"/api/plans/{dir_plan}/insertion-preview",
+            {"reagent_name": "X", "categories": ["ins_cat_x"], "amount_ml": 2})
+check("有向规则：首位 0 警示、其后 1 警示，推荐首位",
+      r["recommendation"]["position"] == 0
+      and r["positions"][0]["warning_findings_count"] == 0
+      and r["positions"][1]["warning_findings_count"] == 1
+      and r["positions"][1]["candidate_findings"][0]["match_direction"] == "incoming->existing",
+      r["positions"])
+
+# 规则版本口径：方案①发布把 R001 降为 medium 的版本后，候选盐酸不再触发 high
+s, draft = call("POST", "/api/plans/1/rule-versions", {"note": "插入评估版本测试"})
+ins_vid = draft["id"]
+s, vd = call("GET", f"/api/plans/1/rule-versions/{ins_vid}")
+for x in vd["rules"]:
+    if x["id"] == "R001":
+        x["severity"] = "medium"
+s, _ = call("PUT", f"/api/plans/1/rule-versions/{ins_vid}", {"rules": vd["rules"]})
+s, _ = call("POST", f"/api/plans/1/rule-versions/{ins_vid}/publish", {})
+s, r = call("POST", "/api/plans/1/insertion-preview", {"reagent_id": 1, "amount_ml": 15})
+check("预览沿用方案生效版本快照", r["rule_scope"] == "plan_version"
+      and r.get("rule_version_id") == ins_vid and r["rule_revision"] == "plan1-rv1",
+      (r.get("rule_scope"), r.get("rule_revision")))
+check("R001 降级后候选处处可安全加入且无 high", all(p["candidate_safe"] for p in r["positions"])
+      and all(p["high_findings_count"] == 0 for p in r["positions"]), r["positions"])
+s, _ = call("POST", f"/api/plans/1/rule-versions/{ins_vid}/deactivate", {})
+s, r = call("POST", "/api/plans/1/insertion-preview", {"reagent_id": 1, "amount_ml": 15})
+check("停用版本后回落全局图（候选重新处处不安全）", r["rule_scope"] == "global"
+      and not any(p["candidate_safe"] for p in r["positions"]), r["rule_scope"])
+
+# 纯预览不落库、不要求安全确认
+s, plan1_before = call("GET", "/api/plans/1")
+check("评估不改变方案步骤数", len(plan1_before["steps"]) == 3, plan1_before["steps"])
+# 临时试剂 / 错误输入
+s, r = call("POST", "/api/plans/1/insertion-preview",
+            {"reagent_name": "临时显影液", "categories": ["reducer", " weak_acid_salt "], "amount_ml": 8})
+check("临时试剂评估成功且类别归一化", s == 200 and r["candidate"]["categories"]
+      == ["reducer", "weak_acid_salt"], (s, r))
+for code, body in [
+    (422, {"reagent_name": "X", "categories": [], "amount_ml": 5}),      # 类别为空
+    (422, {"reagent_name": "X", "categories": ["a"], "amount_ml": 0}),   # 用量非正
+    (422, {"reagent_name": "X", "categories": ["a"], "amount_ml": -2}),  # 用量负
+    (422, {"amount_ml": 5}),                                            # 试剂全缺
+    (422, {"reagent_id": 1, "reagent_name": "Y", "categories": ["a"], "amount_ml": 5}),  # 二选一
+    (404, {"reagent_id": 999999, "amount_ml": 5}),                      # 档案不存在
+]:
+    s, e = call("POST", "/api/plans/1/insertion-preview", body)
+    check(f"错误输入 {body} -> {code}", s == code, (s, e))
+s, e = call("POST", "/api/plans/999999/insertion-preview", {"reagent_id": 1, "amount_ml": 5})
+check("方案不存在 -> 404", s == 404, s)
+
+# 空方案也可评估（仅 1 个位置）
+s, ep = call("POST", "/api/plans", {"name": "测试-插入评估空方案", "steps": []})
+empty_plan = ep["id"]
+s, r = call("POST", f"/api/plans/{empty_plan}/insertion-preview", {"reagent_id": 1, "amount_ml": 10})
+check("空方案 1 个位置且候选安全", s == 200 and r["position_count"] == 1
+      and r["positions"][0]["candidate_safe"] is True, (s, r))
+
+# 清理（不删种子方案与自定义规则 C020 以外的种子状态；自定义规则删除）
+call("DELETE", f"/api/plans/{ins_plan}")
+call("DELETE", f"/api/plans/{dir_plan}")
+call("DELETE", f"/api/plans/{empty_plan}")
+call("DELETE", "/api/rules/C020")
+
 print(f"\n结果：{PASS} 通过，{FAIL} 失败")
 sys.exit(1 if FAIL else 0)

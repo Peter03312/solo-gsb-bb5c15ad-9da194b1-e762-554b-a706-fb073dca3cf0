@@ -8,7 +8,15 @@ from sqlalchemy.orm import Session
 from .. import models, safety, versioning
 from ..database import get_db
 from ..deduce import _step_categories, build_report, persist_run
-from ..schemas import PlanCreate, PlanOut, PlanUpdate, StepOut, StepSafetyUpdate
+from ..insertion import Candidate, evaluate_insertion
+from ..schemas import (
+    InsertionPreviewIn,
+    PlanCreate,
+    PlanOut,
+    PlanUpdate,
+    StepOut,
+    StepSafetyUpdate,
+)
 
 router = APIRouter(prefix="/api/plans", tags=["plans"])
 
@@ -192,6 +200,61 @@ def simulate_plan(
     run_id = persist_run(db, plan, report, persist=persist, rule_version_id=resolved_vid)
     report["run_id"] = run_id
     return report
+
+
+@router.post("/{plan_id}/insertion-preview")
+def insertion_preview(
+    plan_id: int,
+    payload: InsertionPreviewIn,
+    db: Session = Depends(get_db),
+):
+    """评估一股待加试剂放在已保存方案的哪个步骤间更合适（纯预览，不落库）。
+
+    - 候选试剂：reagent_id 引用试剂档案，或 reagent_name + 非空 categories 的临时试剂；
+      两者不能同时给出；amount_ml 必须为正数（由请求模型拦截非正数 → 422）；
+    - 系统对首位、每对相邻步骤之间、末尾共 N+1 个位置逐一预演，沿用方案当前生效
+      规则版本（没有时使用全局启用规则图），按现有有向 / 无向类别匹配与首次 high
+      即中止的口径返回首次危险、被阻断的原步骤与命中依据；
+    - 推荐：优先无 high 的位置；全有 high 时选被阻断原步骤最少者，
+      再按警示命中少、位置靠前决胜。
+    - 结果只作预览：不保存步骤、不产生推演记录，也不检查安全确认。
+    """
+    plan = db.get(models.Plan, plan_id)
+    if plan is None:
+        raise HTTPException(404, "方案不存在")
+
+    has_id = payload.reagent_id is not None
+    has_name = bool((payload.reagent_name or "").strip())
+    if has_id and has_name:
+        raise HTTPException(422, "档案试剂与临时试剂名只能二选一：请只给 reagent_id，或只给 reagent_name 与 categories")
+
+    if has_id:
+        reagent = db.get(models.Reagent, payload.reagent_id)
+        if reagent is None:
+            raise HTTPException(404, f"试剂 id={payload.reagent_id} 不存在")
+        candidate = Candidate(
+            name=reagent.name,
+            categories=json.loads(reagent.categories or "[]"),
+            amount_ml=payload.amount_ml,
+            reagent_id=reagent.id,
+        )
+    else:
+        if not has_name:
+            raise HTTPException(422, "请输入档案试剂（reagent_id），或填写临时试剂名称")
+        categories = []
+        for c in payload.categories or []:
+            key = c.strip()
+            if key and key not in categories:
+                categories.append(key)
+        if not categories:
+            raise HTTPException(422, "临时试剂必须填写至少一个非空相容性类别")
+        candidate = Candidate(
+            name=payload.reagent_name.strip(),
+            categories=categories,
+            amount_ml=payload.amount_ml,
+        )
+
+    return evaluate_insertion(db, plan, candidate)
 
 
 @router.post("/simulate-dry")

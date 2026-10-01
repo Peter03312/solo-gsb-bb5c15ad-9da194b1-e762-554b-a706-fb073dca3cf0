@@ -605,3 +605,36 @@ textarea { resize: vertical; }
   .merge-sides { flex-direction: column; }
   .merge-arrow { transform: rotate(90deg); }
 }
+
+/* ---------------- 待加试剂插入位置评估 ---------------- */
+.ins-positions { display: flex; flex-direction: column; gap: 12px; }
+.ins-position {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px 14px;
+  background: var(--bg, #fafafa);
+}
+.ins-position.recommended {
+  border: 2px solid var(--ok, #16a34a);
+  background: var(--ok-bg, #f0fdf4);
+}
+.ins-pos-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 8px; }
+.ins-pos-title { font-weight: 700; font-size: 14.5px; }
+.ins-danger {
+  margin: 6px 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--high-bg, #fef2f2);
+  border-left: 4px solid var(--high, #dc2626);
+  font-size: 13.5px;
+}
+.ins-blocked {
+  margin: 6px 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--medium-bg, #fffbeb);
+  font-size: 13.5px;
+}
+.ins-findings-head { margin: 8px 0 6px; }
+.ins-finding { cursor: pointer; }
+.ins-finding:hover { box-shadow: 0 1px 6px rgba(0,0,0,0.12); }

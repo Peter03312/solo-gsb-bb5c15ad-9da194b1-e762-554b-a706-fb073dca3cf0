@@ -244,6 +244,21 @@ class BucketingPreviewIn(BaseModel):
     streams: list[WasteStreamIn] = Field(min_length=1, max_length=12)
 
 
+# ---------- 待加试剂插入位置评估（纯预览） ----------
+
+class InsertionPreviewIn(BaseModel):
+    """在已保存方案中评估一股待加试剂放在哪个步骤间更合适（只预演不落库）。
+
+    试剂二选一：reagent_id 引用试剂档案；或 reagent_name + 非空 categories 的临时试剂。
+    amount_ml 必须为正数。
+    """
+
+    reagent_id: Optional[int] = None
+    reagent_name: Optional[str] = Field(default=None, max_length=128)
+    categories: Optional[list[str]] = None  # 临时试剂类别（非空）
+    amount_ml: float = Field(gt=0, le=1_000_000)
+
+
 # ---------- 方案 CSV 导入 ----------
 
 class ImportPreviewIn(BaseModel):

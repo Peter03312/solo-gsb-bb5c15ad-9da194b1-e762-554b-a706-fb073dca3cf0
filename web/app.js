@@ -519,6 +519,7 @@ function renderPlanList() {
       actions.append(
         actionBtn("编辑", "btn-small", () => editPlan(p)),
         actionBtn("⚡ 推演", "btn-small btn-primary", () => simulatePlan(p).catch((e) => toast(e.message, true))),
+        actionBtn("🧪 待加试剂评估", "btn-small", () => openInsertionModal(p)),
         actionBtn("📦 规则版本", "btn-small", () => openPlanVersions(p)),
         actionBtn("导出 JSON", "btn-small", () => exportPlan(p.id)),
         actionBtn("删除", "btn-small btn-danger", () => removePlan(p)),
@@ -973,6 +974,189 @@ function renderBkOversized(detail) {
       </div>
     </div>`;
   host.scrollIntoView?.({ behavior: "smooth", block: "start" });
+}
+
+/* ---------------- 待加试剂插入位置评估（预览不落库） ---------------- */
+
+function openInsertionModal(plan) {
+  openModal(`
+    <button class="btn btn-ghost modal-close">✕ 关闭</button>
+    <h3>🧪 待加试剂插入位置评估 — ${escapeHtml(plan.name)}</h3>
+    <p class="hint">输入<b>档案试剂</b>，或填写<b>临时试剂名 + 非空类别</b>与<b>正数用量</b>：
+      系统将在<b>首位、每对相邻步骤之间、末尾</b>共 ${plan.steps.length + 1} 个位置逐一预演，
+      沿用该方案<b>当前生效规则版本</b>（无则全局启用规则图），按现有有向 / 无向匹配与首次 high 即中止口径，
+      返回首次危险、被阻断的原步骤与命中依据。结果<b>只作预览，不保存步骤或推演记录，也不要求安全确认</b>。</p>
+    <div class="form">
+      <label>档案试剂（与临时试剂二选一）
+        <select id="insReagent">
+          <option value="">— 使用临时试剂（手动填写）—</option>
+          ${state.reagents.map((r) => `<option value="${r.id}">${escapeHtml(r.name)}</option>`).join("")}
+        </select>
+      </label>
+      <div class="form-row">
+        <label>临时试剂名
+          <input type="text" id="insName" maxlength="128" placeholder="档案外试剂名称" />
+        </label>
+        <label>用量 (mL/g)
+          <input type="number" id="insAmount" min="0" step="0.1" placeholder="如 15（须为正数）" />
+        </label>
+      </div>
+      <label>临时试剂相容性类别（非空；档案试剂以档案类别为准，可忽略此项）
+        <div class="chips" id="insCats"></div>
+        <input type="text" id="insCatsCustom" placeholder="自定义类别，回车添加（英文 key，如 cyanide）" />
+      </label>
+      <div class="form-actions">
+        <button type="button" class="btn btn-primary" id="btnInsEval">🔍 逐位置预演并推荐</button>
+      </div>
+    </div>
+    <div id="insResult"></div>
+  `);
+  $("#modalBox").classList.add("modal-wide");
+
+  const catBox = $("#insCats");
+  const selected = new Set();
+  const renderChips = () => {
+    catBox.innerHTML = "";
+    Object.entries(state.categories).forEach(([key, meta]) => {
+      const chip = document.createElement("span");
+      chip.className = "chip" + (selected.has(key) ? " on" : "");
+      chip.textContent = meta.label || key;
+      chip.title = key;
+      chip.addEventListener("click", () => {
+        selected.has(key) ? selected.delete(key) : selected.add(key);
+        renderChips();
+      });
+      catBox.appendChild(chip);
+    });
+    selected.forEach((key) => {
+      if (state.categories[key]) return;
+      const chip = document.createElement("span");
+      chip.className = "chip on";
+      chip.textContent = key;
+      chip.title = key;
+      chip.addEventListener("click", () => { selected.delete(key); renderChips(); });
+      catBox.appendChild(chip);
+    });
+  };
+  renderChips();
+  $("#insCatsCustom").addEventListener("keydown", (e) => {
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    const key = e.target.value.trim();
+    if (key) { selected.add(key); e.target.value = ""; renderChips(); }
+  });
+  $("#btnInsEval").addEventListener("click", async () => {
+    try {
+      const rid = $("#insReagent").value ? Number($("#insReagent").value) : null;
+      const name = $("#insName").value.trim();
+      const amountRaw = $("#insAmount").value;
+      const amount = amountRaw === "" ? NaN : Number(amountRaw);
+      if (!(amount > 0)) throw new Error("请填写大于 0 的用量");
+      if (rid === null && !name) throw new Error("请选择档案试剂，或填写临时试剂名称");
+      if (rid !== null && name) throw new Error("档案试剂与临时试剂名只能二选一");
+      const body = { amount_ml: amount };
+      if (rid !== null) body.reagent_id = rid;
+      else {
+        if (!selected.size) throw new Error("临时试剂必须选择或填写至少一个相容性类别");
+        body.reagent_name = name;
+        body.categories = [...selected];
+      }
+      const result = await api(`/api/plans/${plan.id}/insertion-preview`, { method: "POST", body });
+      renderInsertionResult(result);
+    } catch (err) {
+      toast(err.message, true);
+    }
+  });
+}
+
+function insStateBadge(p) {
+  if (p.candidate_safe) return '<span class="badge badge-ok">✅ 候选可安全加入</span>';
+  if (p.candidate_blocked) return '<span class="badge badge-blocked">⛔ 候选被阻断（未加入）</span>';
+  if (p.candidate_triggers_high) return '<span class="badge badge-high">🛑 候选触发严重</span>';
+  return '<span class="badge badge-medium">⚠️ 候选卷入严重</span>';
+}
+
+function insFindingBadge(f) {
+  return `<span class="badge badge-${f.severity}">[${escapeHtml(f.rule_id)}] ${escapeHtml(f.severity_label)}</span>
+    ${escapeHtml(f.title)}（与「${escapeHtml(f.counterpart_reagent)}」，
+    ${f.match_direction === "incoming->existing" ? "待加试剂 → 已存在" : "已存在 → 待加试剂"}
+    ${f.rule_directional ? "· 有向" : "· 无向"}）`;
+}
+
+function renderInsertionResult(d) {
+  const host = $("#insResult");
+  const rec = d.recommendation;
+  const baselineBlocked = d.baseline.blocked_steps.length
+    ? `原方案首次危险在第 ${d.baseline.first_danger?.step + 1} 步（${escapeHtml(d.baseline.first_danger?.rule_id || "")}），阻断步骤 ${d.baseline.blocked_steps.map((x) => x + 1).join("、")}`
+    : "原方案无 high 中止";
+  host.innerHTML = `
+    <div class="report-banner ${rec.tier === "no_high" ? "safe" : "danger"}">
+      <span class="big">${rec.tier === "no_high" ? "✅" : "⚠️"}</span>
+      <div style="flex:1">
+        <h2>推荐位置：${escapeHtml(rec.position_label)}</h2>
+        <p>${escapeHtml(rec.reason)}</p>
+        <p class="item-meta">候选「${escapeHtml(d.candidate.name)}」${escapeHtml((d.candidate.categories || []).map(catLabel).join(" / "))}
+          · 用量 ${d.candidate.amount_ml} · ${d.original_step_count} 个原步骤 / ${d.position_count} 个候选位置
+          · 规则口径：${d.rule_scope === "plan_version" ? "方案生效版本 " + escapeHtml(d.rule_revision) : "全局启用规则图 " + escapeHtml(d.rule_revision)}
+          · ${baselineBlocked} · 预览不落库</p>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2>各位置逐一预演（${d.positions.length} 个）</h2></div>
+      <div class="ins-positions">${d.positions.map((p) => renderInsertionPosition(d, p, rec.position)).join("")}</div>
+    </div>`;
+
+  // 点击命中依据查看规则详情
+  $$(".ins-finding", host).forEach((el) => {
+    el.addEventListener("click", () => {
+      const pos = d.positions[Number(el.dataset.pos)];
+      const f = pos.candidate_findings[Number(el.dataset.fidx)];
+      openFindingModal({
+        ...f,
+        incoming_reagent: f.incoming_step_kind === "candidate" ? d.candidate.name : f.counterpart_reagent,
+        existing_reagent: f.existing_step_kind === "candidate" ? d.candidate.name : f.counterpart_reagent,
+        incoming_step: f.incoming_step_kind === "candidate" ? pos.candidate_step : (f.counterpart_original_step ?? 0),
+        existing_step: f.existing_step_kind === "candidate" ? pos.candidate_step : (f.counterpart_original_step ?? 0),
+      }, d.rule_revision);
+    });
+  });
+}
+
+function renderInsertionPosition(d, p, recPos) {
+  const fd = p.first_danger;
+  const dangerHtml = fd ? `
+    <div class="ins-danger">
+      🛑 首次危险：<b>${fd.step_kind === "candidate" ? "待加试剂步骤" : `原第 ${fd.step + 1} 步「${escapeHtml(fd.reagent_name)}」`}</b>
+      与<b>${fd.conflicts_with_kind === "candidate" ? "待加试剂" : `原第 ${fd.conflicts_with_step + 1} 步「${escapeHtml(fd.conflicts_with_reagent)}」`}</b>
+      命中 <span class="badge badge-high">[${escapeHtml(fd.rule_id)}] ${escapeHtml(fd.title)}</span>
+      <div class="m-eq">${escapeHtml(fd.reaction)}</div>
+    </div>` : '<div class="hint">该位置推演无首次危险。</div>';
+  const blockedHtml = p.blocked_original_steps.length
+    ? `<div class="ins-blocked">⛔ 被阻断的原步骤：${p.blocked_original_steps.map((x) => x + 1).join("、")}
+        （${p.executed_original_step_count}/${d.original_step_count} 个原步骤可执行）</div>`
+    : '<div class="hint">无原步骤被阻断。</div>';
+  const findingsHtml = p.candidate_findings.length
+    ? `<div class="finding-list">${p.candidate_findings.map((f, i) => `
+        <div class="finding-card ${f.severity} ins-finding" data-pos="${p.position}" data-fidx="${i}">
+          <div class="fc-title">${insFindingBadge(f)}</div>
+          <div class="fc-meta">类别 ${escapeHtml(catLabel(f.incoming_category))} × ${escapeHtml(catLabel(f.existing_category))} · 点击查看方程式 / 机理 / 文献</div>
+        </div>`).join("")}</div>`
+    : '<div class="hint">待加试剂无任何命中。</div>';
+  const warnBadge = p.warning_findings_count
+    ? `<span class="badge badge-medium">⚠️ 警示 ${p.warning_findings_count}（Δ${p.warning_findings_delta >= 0 ? "+" : ""}${p.warning_findings_delta}）</span>`
+    : '<span class="badge badge-low">无警示</span>';
+  return `
+    <div class="ins-position${p.position === recPos ? " recommended" : ""}">
+      <div class="ins-pos-head">
+        <span class="ins-pos-title">${p.position === recPos ? "⭐ " : ""}位置 ${p.position} · ${escapeHtml(p.position_label)}</span>
+        ${insStateBadge(p)} ${warnBadge}
+        ${p.has_high ? '<span class="badge badge-high">推演含 high</span>' : ""}
+      </div>
+      ${dangerHtml}
+      ${blockedHtml}
+      <div class="ins-findings-head hint">待加试剂参与的命中（${p.candidate_findings.length} 条）：</div>
+      ${findingsHtml}
+    </div>`;
 }
 
 function actionBtn(text, cls, fn) {
